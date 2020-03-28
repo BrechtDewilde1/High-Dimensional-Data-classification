@@ -1,30 +1,124 @@
 ---
 title: "HW2"
 author: "Brecht Dewilde"
-date: "28-3-2020"
-output: pdf_document
+output:
+  html_document:
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+setwd("~/Github/High-Dimensional-Data-classification")
+library("Matrix")
+library("glmnet")
+library("ggplot2")
+library("ROCR")
+library("pROC")
 ```
 
-## R Markdown
-
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r loading the data, echo = FALSE}
+load(file = "DataSet.RData")
 ```
 
-## Including Plots
+```{r splitting the data}
+## 75-25 train-test split
+# id creation
+set.seed(123)
+smp_size <- floor(0.75 * nrow(DataSet))
+train_ind <- sample(seq_len(nrow(DataSet)), size = smp_size)
 
-You can also embed plots, for example:
+# train test split
+train <- DataSet[train_ind, ]
+test <- DataSet[-train_ind, ]
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# x y split
+ytrain <- train$Y
+xtrain <- train[,c(2:length(train))]
+ytest <- test$Y
+xtest <- test[, c(2:length(test))]
+
+rm("smp_size", "train_ind", "DataSet", "test", "train")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### Procedure description
+The dataset contains 775 observations with 996 predictor variables and one binary target variable. $\approx 50 \%$ have 1 as target variable. The training data is created by randomly sampling 75% of the data. The target variable of the training data has $49\%$ with target variable one, indicating that this is a good representing sample. The remaining 25% will be used to assess the model performance. Coefficients estimates are found by applying maximum likelihood on the following penalized logistic regression function: $$\hat{\boldsymbol{\beta}}=\operatorname{ArgMax}_{\beta} l(\boldsymbol{\beta})-\gamma|\boldsymbol{\beta}|$$
+An appropriate value for the $l_1$ penalty term is find by performing 10-fold-cross-validated AUC selection on the training data. The $l_1$ value with the highest cross-validated results in the following model:
+
+```{r train the model and AUC cross validation to obtain best lasso hyperparameter value}
+# The glm package expectes a matrix and not a dataframe for its input values
+xtrain <- as.matrix(xtrain)
+xtest <- as.matrix(xtest)
+
+# Model creation and AUC Cross-validation
+cv_auc <- cv.glmnet(x = xtrain, y = ytrain, alpha = 1, family = "binomial", type.measure = "auc")
+
+# Obtain the best l1 penality term (aka the penalty term that leads to the largest AUC)
+best_lambda <- cv_auc$lambda.min
+
+best_model <- glmnet(x = xtrain, y = ytrain, family = "binomial", lambda = best_lambda)
+coefficients <- c(coef(best_model)[1,], coef(best_model)[,1][coef(best_model)[,1] > 0])
+names(coefficients) <- c("intercept", names(coefficients)[2:length(coefficients)])
+coefficients
+```
+However, the objective of regularisation is to balance accuracy and simplicity. Therefore it can be beneficial to find that $l_1$ that results in the simplest model and lies within one standard error of the optimal value. A graphical represention of this is presented below. 
+
+```{r plot with lambdas between 1se}
+plot(cv_auc, xlab = "l1")
+```
+
+The area between the dashed lines indicate these lambda values at one standard error of that lambda that resulted in the highest AUC. Consequently, a logistic regression model is estimated for each lambda value. The lambda that results in the model with the least amount of predictors is chosen. This lambda results in the following model coefficients:
+```{r model with labmda 1se}
+lambda_1se <- cv_auc$lambda.1se
+modelse <- glmnet(x = xtrain, y = ytrain, family = "binomial", lambda = lambda_1se)
+coefficients <- c(coef(modelse)[1,], coef(modelse)[,1][coef(modelse)[,1] > 0])
+names(coefficients) <- c("intercept", names(coefficients)[2:length(coefficients)])
+coefficients
+```
+As this model is clearly a lot more simplified than the previous model this model is choosed as the best model. 
+
+The shrinkage influence of the $l_1$ value on the coefficients estimates is visualized in the following figure. The feature selection characteristics of lasso regression is clearly visible as many coefficients obtain value zero.
+
+```{r showing influence of the shrinkage parameter}
+model <- glmnet(x = xtrain, y = ytrain, family = "binomial")
+plot(model, xvar= "lambda")
+```
+
+The output of a logistic regression model is the estimated probability that the observation belongs to class one:
+$\hat{\pi}(\boldsymbol{x})=\mathrm{P}\{\widehat{Y=1} | \boldsymbol{x}\}$. A *classification threshold* has to be defined, such that each observation with a predicted probability higher than this threshold will be assigned to class 1. A ROC curve will be plotted to see the trade-off between the **true-positive rate** and the **false-positive-rate** for different threshold values. 
+
+```{r construct ROC and select appropriate threshold}
+# probability estimates for the xtest dataset
+ypred <- predict(modelse, newx = xtest, type = "response")
+
+# obtain standardized class for roc creation
+predictions <- prediction(ypred, ytest)
+
+# Get auc
+auc <- round(unlist(performance(predictions, "auc")@y.values),3)
+
+# ROCR plot
+performance_measures <- performance(predictions, "sens", "fpr")
+plot(performance_measures, main = "Receiver operating curve") + 
+  text(0.8, 0.5,  paste("AUC:", auc))
+```
+As there is no information about the meaning of target value, there is no preference between sensitivity($S_e$) and specificity ($S_p$). In  this case, there are generally two approaches applied in practice:
+
+1) The threshold is set equal to the particular point where $S_e = S_p$. This point is mathematically the intersection of the line connecting the left-upper corner and the right-lower corner of the unit square (the line Se = Sp), and the ROC curve.
+
+2) Another approach to maximize both Se and Sp is to maximize their summation (Se + Sp). It is proven that the Youden's index (Se + Sp - 1) is also maximized at this point. Consequently, the Youden's index is typically be used for this purpose.  This is a commonly used technique to determine the most appropriate cut-off value and corresponds to a point on the ROC curve with the highest vertical distance from the 45° diagonal line.
+
+```{r best thresholds}
+# obtain performance measures given the actual value and predicted value
+prbe_threshold <- unlist(performance(predictions, "prbe")@x.values)
+prbe_sens_spec <- unlist(performance(predictions, "prbe")@y.values)
+
+# Approach 2
+roc_obj <- roc(ytest, ypred[,1])
+#get the "best" "threshold"
+# there are lots of other options for other metrics as well
+max_threshold <- coords(roc_obj, "best", "threshold")$threshold
+max_specificity <- coords(roc_obj, "best", "threshold")$specificity
+max_sensitivity <- coords(roc_obj, "best", "threshold")$sensitivity
+```
+
+
